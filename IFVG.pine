@@ -1,0 +1,382 @@
+//@version=6
+indicator("IFVG", overlay=true,
+  max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ─── UDT ────────────────────────────────────────────────────────────────────
+// Stores the price boundaries and direction of each FVG / iFVG zone.
+// bar_time records the timestamp (ms) of the first candle in the 3-candle
+// pattern. Used as the box left edge with xloc.bar_time to avoid the
+// bar_index distance limit on long histories.
+type fvg
+    float max
+    float min
+    bool  isbull
+    int   bar_time
+    int   bar_idx
+
+// ─── INPUTS ─────────────────────────────────────────────────────────────────
+
+// --- FVG Settings ---
+grpFVG = "FVG Settings"
+threshold     = input.float(0.0, "Min FVG Size %", minval=0.0, step=0.01,
+  group=grpFVG,
+  tooltip="Minimum gap size as % of price. 0 = detect all. Example on NQ ~23000: 0.02 = gaps >= ~4.6 pts, 0.05 = gaps >= ~11.5 pts.")
+mitType       = input.string("Close", "Mitigation By",
+  options=["Close", "Wick"], group=grpFVG,
+  tooltip="Close: candle close must violate zone. Wick: candle wick (low for bull, high for bear).")
+showFVG       = input.bool(true, "Show Original FVGs", group=grpFVG,
+  tooltip="Display the original FVG boxes before they flip to IFVGs.")
+showIFVG      = input.bool(true, "Show IFVG Zones", group=grpFVG,
+  tooltip="Display the inverted FVG zones after polarity flip.")
+extendBars    = input.int(10, "Extend Boxes (bars)", minval=0, maxval=5000,
+  group=grpFVG,
+  tooltip="How many bars to extend zone boxes to the right.")
+maxAgeBars    = input.int(50, "Max Zone Age (bars)", minval=10, maxval=5000,
+  group=grpFVG,
+  tooltip="Remove FVG and IFVG zones older than this many bars. Keeps the chart clean.")
+encompassVI   = input.bool(true, "Encompass Volume Imbalances", group=grpFVG,
+  tooltip="Expand FVG boundaries to include adjacent volume imbalances (body gaps beside the middle candle). When VIs exist on both sides, both are encompassed into one zone per ICT.")
+maxFVGCount   = input.int(2, "Max FVGs Shown", minval=1, maxval=50,
+  group=grpFVG, inline="maxcnt")
+maxIFVGCount  = input.int(2, "Max IFVGs", minval=1, maxval=50,
+  group=grpFVG, inline="maxcnt",
+  tooltip="Display limit only — how many of the most recent zones are drawn. Older FVGs stay tracked behind the scenes and will still flip into an IFVG when price closes through them.")
+
+// --- Visual Settings ---
+grpVisual = "Visual Settings"
+bullFVGColor  = input.color(color.new(#2962FF, 80), "Bull FVG Color",
+  group=grpVisual, inline="fvg")
+bearFVGColor  = input.color(color.new(#F23645, 80), "Bear FVG Color",
+  group=grpVisual, inline="fvg")
+bullIFVGColor = input.color(color.new(#00BCD4, 70), "Bull IFVG Color",
+  group=grpVisual, inline="ifvg")
+bearIFVGColor = input.color(color.new(#FF9800, 70), "Bear IFVG Color",
+  group=grpVisual, inline="ifvg")
+
+// --- C.E. (Consequent Encroachment) — hardcoded ---
+// Midpoint (50%) line of each FVG / IFVG zone. Always drawn:
+// #424351, fully opaque, dotted, width 1.
+const bool  showCE      = true
+const color bullCEColor = #424351
+const color bearCEColor = #424351
+const int   ceWidth     = 1
+
+// --- Label Settings ---
+grpLabel = "Label Settings"
+showLabel     = input.bool(true, "Label", group=grpLabel, inline="lbl")
+lblTextColor  = input.color(color.new(#424351, 50), "", group=grpLabel, inline="lbl")
+lblBgColor    = input.color(color.new(#F4F4F7, 100), "", group=grpLabel, inline="lbl")
+lblSizeStr    = input.string("small", "", options=["tiny", "small", "normal", "large"],
+  group=grpLabel, inline="lbl")
+lblHAlignStr  = input.string("Right", "Text alignment",
+  options=["Left", "Center", "Right"], group=grpLabel, inline="lblAlign",
+  tooltip="Horizontal placement along the zone. Right and Center track the zone as it extends. Vertical placement is fixed at the zone midpoint (C.E. level).")
+// Zone label text — hardcoded.
+const string lblBullFVGText  = "+FVG"
+const string lblBearFVGText  = "-FVG"
+const string lblBullIFVGText = "+IFVG"
+const string lblBearIFVGText = "-IFVG"
+
+// Map string inputs to Pine constants
+ceStyle = line.style_dotted
+lblSize = lblSizeStr == "tiny" ? size.tiny :
+  lblSizeStr == "small" ? size.small :
+  lblSizeStr == "normal" ? size.normal : size.large
+lblStyle = lblHAlignStr == "Center" ? label.style_label_center : label.style_label_left
+// Note: for "Right", the label anchors at the zone's right edge with
+// label.style_label_left, so the text extends OUTSIDE the box to the right.
+// This keeps the CE line from cutting through the text.
+
+// ─── LABEL POSITION HELPERS ─────────────────────────────────────────────────
+// Compute label anchor from zone bounds per the alignment inputs.
+f_lblX(int leftT, int rightT) =>
+    lblHAlignStr == "Left" ? leftT : lblHAlignStr == "Right" ? rightT : (leftT + rightT) / 2
+
+// Vertical label position is hardcoded to the zone midpoint (C.E. level).
+f_lblY(float zMax, float zMin) =>
+    math.avg(zMax, zMin)
+
+// ─── ZONE COUNT TRIMMER ─────────────────────────────────────────────────────
+// Display count and tracking are SEPARATE concerns:
+//   - Beyond maxDraw, drawings are deleted but the RECORD is kept, so an
+//     older FVG still inverts into an IFVG when price closes through it.
+//     (Previously the record was deleted with the box, silently
+//      suppressing valid IFVGs from any gap older than the display cap.)
+//   - Beyond MAX_TRACK, records are dropped entirely to bound memory.
+// Newest are at index 0 (unshift), so both operate from the tail.
+const int MAX_TRACK = 50
+
+f_trim(array<fvg> recs, array<box> bxs, array<line> lns, array<label> lbls, int maxDraw) =>
+    // Hide (but keep) zones beyond the display cap
+    if recs.size() > maxDraw
+        for i = maxDraw to recs.size() - 1
+            box b = bxs.get(i)
+            if not na(b)
+                b.delete()
+                bxs.set(i, na)
+            line l = lns.get(i)
+            if not na(l)
+                l.delete()
+                lns.set(i, na)
+            label lb = lbls.get(i)
+            if not na(lb)
+                lb.delete()
+                lbls.set(i, na)
+    // Drop the oldest records once past the tracking limit
+    while recs.size() > MAX_TRACK
+        int last = recs.size() - 1
+        box b = bxs.get(last)
+        if not na(b)
+            b.delete()
+        line l = lns.get(last)
+        if not na(l)
+            l.delete()
+        label lb = lbls.get(last)
+        if not na(lb)
+            lb.delete()
+        bxs.remove(last)
+        lns.remove(last)
+        lbls.remove(last)
+        recs.remove(last)
+
+// ─── ARRAYS ─────────────────────────────────────────────────────────────────
+// Parallel arrays: records + boxes + CE lines + labels, for FVGs and IFVGs.
+// Boxes/lines/labels may contain na when the corresponding toggle is off.
+var fvg_records  = array.new<fvg>(0)
+var fvg_boxes    = array.new<box>(0)
+var fvg_lines    = array.new<line>(0)
+var fvg_labels   = array.new<label>(0)
+var ifvg_records = array.new<fvg>(0)
+var ifvg_boxes   = array.new<box>(0)
+var ifvg_lines   = array.new<line>(0)
+var ifvg_labels  = array.new<label>(0)
+
+// ─── EXTEND DURATION ────────────────────────────────────────────────────────
+// Convert extendBars to milliseconds so box right edges stay correct when
+// using xloc.bar_time. timeframe.in_seconds() returns current TF seconds.
+int tfMs       = math.round(timeframe.in_seconds() * 1000)
+int extendMs   = extendBars * tfMs
+// Age is measured in BARS ELAPSED (bar_index), not wall-clock time, so
+// zones survive session breaks, weekends and holiday gaps correctly.
+
+// ─── FVG DETECTION ──────────────────────────────────────────────────────────
+// Classic 3-candle FVG pattern:
+//   Bull FVG: candle 0's low > candle 2's high (gap up), confirmed by
+//             candle 1's close above candle 2's high.
+//   Bear FVG: candle 0's high < candle 2's low (gap down), confirmed by
+//             candle 1's close below candle 2's low.
+// The threshold filter requires the gap to be at least X% of price.
+bull_fvg = low > high[2] and close[1] > high[2] and (threshold == 0.0 or (low - high[2]) / high[2] >= threshold / 100)
+bear_fvg = high < low[2] and close[1] < low[2] and (threshold == 0.0 or (low[2] - high) / high >= threshold / 100)
+
+// ─── VOLUME IMBALANCE ENCOMPASSING ──────────────────────────────────────────
+// A volume imbalance (VI) is a gap between candle BODIES where wicks may
+// still overlap. When VIs sit adjacent to the FVG (beside the middle
+// candle), the true imbalance per ICT spans them too. If enabled, zone
+// boundaries expand from wick levels out to the neighbouring candle bodies:
+//   Bull: bottom drops from high[2] to candle-2's body top (lower VI),
+//         top rises from low to candle-0's body bottom (upper VI).
+//   Bear: mirrored.
+// Each side expands independently; when both VIs exist, both are
+// encompassed together in a single zone.
+float bodyTop0 = math.max(open, close)
+float bodyBot0 = math.min(open, close)
+float bodyTop1 = math.max(open[1], close[1])
+float bodyBot1 = math.min(open[1], close[1])
+float bodyTop2 = math.max(open[2], close[2])
+float bodyBot2 = math.min(open[2], close[2])
+
+// Bull FVG boundaries (zoneTop/zoneBot)
+float bullTop = low
+float bullBot = high[2]
+if encompassVI and bull_fvg
+    if bodyBot1 > bodyTop2   // lower VI: body gap between candle 2 and middle
+        bullBot := bodyTop2
+    if bodyBot0 > bodyTop1   // upper VI: body gap between middle and candle 0
+        bullTop := bodyBot0
+
+// Bear FVG boundaries
+float bearTop = low[2]
+float bearBot = high
+if encompassVI and bear_fvg
+    if bodyTop1 < bodyBot2   // upper VI: body gap between candle 2 and middle
+        bearTop := bodyBot2
+    if bodyTop0 < bodyBot1   // lower VI: body gap between middle and candle 0
+        bearBot := bodyTop0
+
+// ─── FVG REGISTRATION ───────────────────────────────────────────────────────
+// On detection, store the FVG record and optionally draw box + CE + label.
+// time[2] is the timestamp of the first candle in the 3-candle formation.
+if bull_fvg and barstate.isconfirmed
+    float mid = math.avg(bullTop, bullBot)
+    fvg_records.unshift(fvg.new(bullTop, bullBot, true, time[2], bar_index - 2))
+    fvg_boxes.unshift(showFVG ? box.new(time[2], bullTop, time + extendMs, bullBot, xloc=xloc.bar_time, border_color=na, bgcolor=bullFVGColor) : na)
+    fvg_lines.unshift(showFVG and showCE ? line.new(time[2], mid, time + extendMs, mid, xloc=xloc.bar_time, color=bullCEColor, style=ceStyle, width=ceWidth) : na)
+    fvg_labels.unshift(showFVG and showLabel ? label.new(f_lblX(time[2], time + extendMs), f_lblY(bullTop, bullBot), lblBullFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
+
+if bear_fvg and barstate.isconfirmed
+    float mid = math.avg(bearTop, bearBot)
+    fvg_records.unshift(fvg.new(bearTop, bearBot, false, time[2], bar_index - 2))
+    fvg_boxes.unshift(showFVG ? box.new(time[2], bearTop, time + extendMs, bearBot, xloc=xloc.bar_time, border_color=na, bgcolor=bearFVGColor) : na)
+    fvg_lines.unshift(showFVG and showCE ? line.new(time[2], mid, time + extendMs, mid, xloc=xloc.bar_time, color=bearCEColor, style=ceStyle, width=ceWidth) : na)
+    fvg_labels.unshift(showFVG and showLabel ? label.new(f_lblX(time[2], time + extendMs), f_lblY(bearTop, bearBot), lblBearFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
+
+// Enforce max FVG count (oldest trimmed first)
+f_trim(fvg_records, fvg_boxes, fvg_lines, fvg_labels, maxFVGCount)
+
+// ─── FVG MITIGATION LOOP ───────────────────────────────────────────────────
+// Iterate backwards so removing elements mid-loop is safe.
+// When a FVG is fully violated by price, it flips into an iFVG:
+//   - Bull FVG mitigated (price closes/wicks below min) -> bearish iFVG (resistance)
+//   - Bear FVG mitigated (price closes/wicks above max) -> bullish iFVG (support)
+// The iFVG keeps the same price coordinates but flipped polarity.
+
+// Track whether new iFVGs were created this bar (for alerts)
+var bool bull_ifvg_created = false
+var bool bear_ifvg_created = false
+bull_ifvg_created := false
+bear_ifvg_created := false
+
+// Mitigation is evaluated ONLY on confirmed bars. Previously it ran on
+// every realtime tick, so a wick spike could flip an FVG to an iFVG and
+// invalidate that iFVG within the same live bar even if the candle closed
+// back inside -- producing missing or stale zones.
+if barstate.isconfirmed and fvg_records.size() > 0
+    for i = fvg_records.size() - 1 to 0
+        fvg g = fvg_records.get(i)
+        // Mitigation source depends on user choice and FVG direction
+        bool mitigated = false
+        if g.isbull
+            float mitSrc = mitType == "Close" ? close : low
+            mitigated := mitSrc < g.min
+        else
+            float mitSrc = mitType == "Close" ? close : high
+            mitigated := mitSrc > g.max
+
+        bool tooOld = bar_index - g.bar_idx > maxAgeBars
+
+        if tooOld
+            // Age-expired: delete drawings silently, no iFVG spawned
+            box b = fvg_boxes.get(i)
+            if not na(b)
+                b.delete()
+            line l = fvg_lines.get(i)
+            if not na(l)
+                l.delete()
+            label lb = fvg_labels.get(i)
+            if not na(lb)
+                lb.delete()
+            fvg_boxes.remove(i)
+            fvg_lines.remove(i)
+            fvg_labels.remove(i)
+            fvg_records.remove(i)
+
+        else if mitigated
+            // Delete original FVG drawings
+            box b = fvg_boxes.get(i)
+            if not na(b)
+                b.delete()
+            line l = fvg_lines.get(i)
+            if not na(l)
+                l.delete()
+            label lb = fvg_labels.get(i)
+            if not na(lb)
+                lb.delete()
+            fvg_boxes.remove(i)
+            fvg_lines.remove(i)
+            fvg_labels.remove(i)
+            fvg_records.remove(i)
+
+            // Create iFVG with flipped polarity, same coordinates
+            bool ifvgBull = not g.isbull
+            float mid = (g.max + g.min) / 2
+            ifvg_records.unshift(fvg.new(g.max, g.min, ifvgBull, g.bar_time, g.bar_idx))
+
+            color ifvgColor = ifvgBull ? bullIFVGColor : bearIFVGColor
+            color ceColor   = ifvgBull ? bullCEColor : bearCEColor
+            ifvg_boxes.unshift(showIFVG ? box.new(g.bar_time, g.max, time + extendMs, g.min, xloc=xloc.bar_time, border_color=na, bgcolor=ifvgColor) : na)
+            ifvg_lines.unshift(showIFVG and showCE ? line.new(g.bar_time, mid, time + extendMs, mid, xloc=xloc.bar_time, color=ceColor, style=ceStyle, width=ceWidth) : na)
+            ifvg_labels.unshift(showIFVG and showLabel ? label.new(f_lblX(g.bar_time, time + extendMs), f_lblY(g.max, g.min), ifvgBull ? lblBullIFVGText : lblBearIFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
+
+            // Flag for alertcondition
+            if ifvgBull
+                bull_ifvg_created := true
+            else
+                bear_ifvg_created := true
+        else
+            // Not mitigated -- extend box + CE right edge to keep zone visible
+            if showFVG
+                box b = fvg_boxes.get(i)
+                if not na(b)
+                    b.set_right(time + extendMs)
+                line l = fvg_lines.get(i)
+                if not na(l)
+                    l.set_x2(time + extendMs)
+                // Right/Center-aligned labels track the moving zone edge
+                if lblHAlignStr != "Left"
+                    label lb = fvg_labels.get(i)
+                    if not na(lb)
+                        lb.set_x(f_lblX(g.bar_time, time + extendMs))
+
+// Enforce max iFVG count (oldest trimmed first)
+f_trim(ifvg_records, ifvg_boxes, ifvg_lines, ifvg_labels, maxIFVGCount)
+
+// ─── iFVG MITIGATION LOOP ──────────────────────────────────────────────────
+// Same mitigation logic applied to iFVG zones. When price fully violates
+// an iFVG, the zone is invalidated and removed (no further flip).
+// Confirmed bars only (see note above).
+if barstate.isconfirmed and ifvg_records.size() > 0
+    for i = ifvg_records.size() - 1 to 0
+        fvg g = ifvg_records.get(i)
+        bool mitigated = false
+        if g.isbull
+            // Bullish iFVG (support) invalidated when price breaks below
+            float mitSrc = mitType == "Close" ? close : low
+            mitigated := mitSrc < g.min
+        else
+            // Bearish iFVG (resistance) invalidated when price breaks above
+            float mitSrc = mitType == "Close" ? close : high
+            mitigated := mitSrc > g.max
+
+        bool tooOld = bar_index - g.bar_idx > maxAgeBars
+
+        if tooOld or mitigated
+            box b = ifvg_boxes.get(i)
+            if not na(b)
+                b.delete()
+            line l = ifvg_lines.get(i)
+            if not na(l)
+                l.delete()
+            label lb = ifvg_labels.get(i)
+            if not na(lb)
+                lb.delete()
+            ifvg_boxes.remove(i)
+            ifvg_lines.remove(i)
+            ifvg_labels.remove(i)
+            ifvg_records.remove(i)
+        else
+            // Not mitigated -- extend box + CE right edge
+            if showIFVG
+                box b = ifvg_boxes.get(i)
+                if not na(b)
+                    b.set_right(time + extendMs)
+                line l = ifvg_lines.get(i)
+                if not na(l)
+                    l.set_x2(time + extendMs)
+                // Right/Center-aligned labels track the moving zone edge
+                if lblHAlignStr != "Left"
+                    label lb = ifvg_labels.get(i)
+                    if not na(lb)
+                        lb.set_x(f_lblX(g.bar_time, time + extendMs))
+
+// [EXTENSION] Add confluence scoring here (e.g., iFVG overlapping with
+// order block or VWAP band gets higher confidence rating)
+
+// [EXTENSION] Add HTF iFVG detection via request.security() for
+// multi-timeframe confluence
+
+// ─── ALERTS ─────────────────────────────────────────────────────────────────
+alertcondition(bull_ifvg_created, "Bullish IFVG Created",
+  "Bullish IFVG formed -- potential support zone")
+alertcondition(bear_ifvg_created, "Bearish IFVG Created",
+  "Bearish IFVG formed -- potential resistance zone")
