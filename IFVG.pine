@@ -36,6 +36,11 @@ maxAgeBars    = input.int(50, "Max Zone Age (bars)", minval=10, maxval=5000,
   tooltip="Remove FVG and IFVG zones older than this many bars. Keeps the chart clean.")
 encompassVI   = input.bool(true, "Encompass Volume Imbalances", group=grpFVG,
   tooltip="Expand FVG boundaries to include adjacent volume imbalances (body gaps beside the middle candle). When VIs exist on both sides, both are encompassed into one zone per ICT.")
+mergeContig   = input.bool(true, "Merge Contiguous FVGs", group=grpFVG,
+  tooltip="Combine a new FVG into the previous one when they share direction AND their price ranges touch or overlap (within 1 tick) — one continuous inefficiency detected as two patterns. Gaps separated by efficient price stay separate. The merged zone inverts only on a close through the whole combined range.")
+showBullBias  = input.bool(true, "Bullish FVG", group=grpFVG, inline="bias")
+showBearBias  = input.bool(true, "Bearish FVG", group=grpFVG, inline="bias",
+  tooltip="Bias filter — which zone polarity is drawn. Applies to FVGs and IFVGs alike: unchecking Bearish hides -FVG and -IFVG zones. DISPLAY ONLY. Detection never stops, so a hidden bearish FVG still inverts into a +IFVG, which stays visible. Both checked = no bias.")
 maxFVGCount   = input.int(2, "Max FVGs Shown", minval=1, maxval=50,
   group=grpFVG, inline="maxcnt")
 maxIFVGCount  = input.int(2, "Max IFVGs", minval=1, maxval=50,
@@ -107,21 +112,30 @@ f_lblY(float zMax, float zMin) =>
 const int MAX_TRACK = 50
 
 f_trim(array<fvg> recs, array<box> bxs, array<line> lns, array<label> lbls, int maxDraw) =>
-    // Hide (but keep) zones beyond the display cap
-    if recs.size() > maxDraw
-        for i = maxDraw to recs.size() - 1
-            box b = bxs.get(i)
-            if not na(b)
-                b.delete()
-                bxs.set(i, na)
-            line l = lns.get(i)
-            if not na(l)
-                l.delete()
-                lns.set(i, na)
-            label lb = lbls.get(i)
-            if not na(lb)
-                lb.delete()
-                lbls.set(i, na)
+    // Hide (but keep) zones beyond the display cap. Only zones whose
+    // polarity passes the bias filter consume a display slot, so the cap
+    // counts what is actually drawn rather than what was detected -- a
+    // filtered-out zone never eats one of the N visible slots.
+    int shown = 0
+    if recs.size() > 0
+        for i = 0 to recs.size() - 1
+            fvg g = recs.get(i)
+            bool visible = (g.isbull ? showBullBias : showBearBias) and shown < maxDraw
+            if visible
+                shown += 1
+            else
+                box b = bxs.get(i)
+                if not na(b)
+                    b.delete()
+                    bxs.set(i, na)
+                line l = lns.get(i)
+                if not na(l)
+                    l.delete()
+                    lns.set(i, na)
+                label lb = lbls.get(i)
+                if not na(lb)
+                    lb.delete()
+                    lbls.set(i, na)
     // Drop the oldest records once past the tracking limit
     while recs.size() > MAX_TRACK
         int last = recs.size() - 1
@@ -204,22 +218,66 @@ if encompassVI and bear_fvg
     if bodyTop0 < bodyBot1   // lower VI: body gap between middle and candle 0
         bearBot := bodyTop0
 
+// ─── CONTIGUOUS MERGE ───────────────────────────────────────────────────────
+// Price delivered in one direction can leave two 3-candle patterns back to
+// back with no efficient price between them: the lower zone's top and the
+// upper zone's bottom sit within a tick of each other, or the ranges
+// overlap outright. That is ONE inefficiency, so it becomes one zone and
+// the C.E. is the midpoint of the whole thing.
+//
+// Contiguity — not bar distance — is the test. Two same-direction gaps
+// separated by traded-through price stay separate, however close in time,
+// because a merged range there would put the C.E. on a level the algorithm
+// never delivered to.
+//
+// Runs AFTER volume-imbalance expansion, since that expansion is often what
+// brings two neighbouring zones into contact.
+//
+// Returns true when the new gap was absorbed into the newest existing zone.
+f_tryMerge(float nTop, float nBot, bool nBull) =>
+    bool merged = false
+    if mergeContig and fvg_records.size() > 0
+        fvg g = fvg_records.get(0)
+        float tol = syminfo.mintick
+        // Ranges touch or overlap, allowing one tick of separation
+        if g.isbull == nBull and nBot <= g.max + tol and g.min <= nTop + tol
+            g.max := math.max(g.max, nTop)
+            g.min := math.min(g.min, nBot)
+            float mid = math.avg(g.max, g.min)
+            // Redraw in place; the zone keeps its original left edge
+            box b = fvg_boxes.get(0)
+            if not na(b)
+                b.set_top(g.max)
+                b.set_bottom(g.min)
+                b.set_right(time + extendMs)
+            line l = fvg_lines.get(0)
+            if not na(l)
+                l.set_y1(mid)
+                l.set_y2(mid)
+                l.set_x2(time + extendMs)
+            label lb = fvg_labels.get(0)
+            if not na(lb)
+                lb.set_y(mid)
+                lb.set_x(f_lblX(g.bar_time, time + extendMs))
+            merged := true
+    merged
+
 // ─── FVG REGISTRATION ───────────────────────────────────────────────────────
 // On detection, store the FVG record and optionally draw box + CE + label.
 // time[2] is the timestamp of the first candle in the 3-candle formation.
-if bull_fvg and barstate.isconfirmed
+if bull_fvg and barstate.isconfirmed and not f_tryMerge(bullTop, bullBot, true)
     float mid = math.avg(bullTop, bullBot)
     fvg_records.unshift(fvg.new(bullTop, bullBot, true, time[2], bar_index - 2))
-    fvg_boxes.unshift(showFVG ? box.new(time[2], bullTop, time + extendMs, bullBot, xloc=xloc.bar_time, border_color=na, bgcolor=bullFVGColor) : na)
-    fvg_lines.unshift(showFVG and showCE ? line.new(time[2], mid, time + extendMs, mid, xloc=xloc.bar_time, color=bullCEColor, style=ceStyle, width=ceWidth) : na)
-    fvg_labels.unshift(showFVG and showLabel ? label.new(f_lblX(time[2], time + extendMs), f_lblY(bullTop, bullBot), lblBullFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
+    fvg_boxes.unshift(showFVG and showBullBias ? box.new(time[2], bullTop, time + extendMs, bullBot, xloc=xloc.bar_time, border_color=na, bgcolor=bullFVGColor) : na)
+    fvg_lines.unshift(showFVG and showBullBias and showCE ? line.new(time[2], mid, time + extendMs, mid, xloc=xloc.bar_time, color=bullCEColor, style=ceStyle, width=ceWidth) : na)
+    fvg_labels.unshift(showFVG and showBullBias and showLabel ? label.new(f_lblX(time[2], time + extendMs), f_lblY(bullTop, bullBot), lblBullFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
 
-if bear_fvg and barstate.isconfirmed
+if bear_fvg and barstate.isconfirmed and not f_tryMerge(bearTop, bearBot, false)
     float mid = math.avg(bearTop, bearBot)
     fvg_records.unshift(fvg.new(bearTop, bearBot, false, time[2], bar_index - 2))
-    fvg_boxes.unshift(showFVG ? box.new(time[2], bearTop, time + extendMs, bearBot, xloc=xloc.bar_time, border_color=na, bgcolor=bearFVGColor) : na)
-    fvg_lines.unshift(showFVG and showCE ? line.new(time[2], mid, time + extendMs, mid, xloc=xloc.bar_time, color=bearCEColor, style=ceStyle, width=ceWidth) : na)
-    fvg_labels.unshift(showFVG and showLabel ? label.new(f_lblX(time[2], time + extendMs), f_lblY(bearTop, bearBot), lblBearFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
+    fvg_boxes.unshift(showFVG and showBearBias ? box.new(time[2], bearTop, time + extendMs, bearBot, xloc=xloc.bar_time, border_color=na, bgcolor=bearFVGColor) : na)
+    fvg_lines.unshift(showFVG and showBearBias and showCE ? line.new(time[2], mid, time + extendMs, mid, xloc=xloc.bar_time, color=bearCEColor, style=ceStyle, width=ceWidth) : na)
+    fvg_labels.unshift(showFVG and showBearBias and showLabel ? label.new(f_lblX(time[2], time + extendMs), f_lblY(bearTop, bearBot), lblBearFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
 
 // Enforce max FVG count (oldest trimmed first)
 f_trim(fvg_records, fvg_boxes, fvg_lines, fvg_labels, maxFVGCount)
@@ -292,11 +350,12 @@ if barstate.isconfirmed and fvg_records.size() > 0
             float mid = (g.max + g.min) / 2
             ifvg_records.unshift(fvg.new(g.max, g.min, ifvgBull, g.bar_time, g.bar_idx))
 
+            bool  ifvgBias  = ifvgBull ? showBullBias : showBearBias
             color ifvgColor = ifvgBull ? bullIFVGColor : bearIFVGColor
             color ceColor   = ifvgBull ? bullCEColor : bearCEColor
-            ifvg_boxes.unshift(showIFVG ? box.new(g.bar_time, g.max, time + extendMs, g.min, xloc=xloc.bar_time, border_color=na, bgcolor=ifvgColor) : na)
-            ifvg_lines.unshift(showIFVG and showCE ? line.new(g.bar_time, mid, time + extendMs, mid, xloc=xloc.bar_time, color=ceColor, style=ceStyle, width=ceWidth) : na)
-            ifvg_labels.unshift(showIFVG and showLabel ? label.new(f_lblX(g.bar_time, time + extendMs), f_lblY(g.max, g.min), ifvgBull ? lblBullIFVGText : lblBearIFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
+            ifvg_boxes.unshift(showIFVG and ifvgBias ? box.new(g.bar_time, g.max, time + extendMs, g.min, xloc=xloc.bar_time, border_color=na, bgcolor=ifvgColor) : na)
+            ifvg_lines.unshift(showIFVG and ifvgBias and showCE ? line.new(g.bar_time, mid, time + extendMs, mid, xloc=xloc.bar_time, color=ceColor, style=ceStyle, width=ceWidth) : na)
+            ifvg_labels.unshift(showIFVG and ifvgBias and showLabel ? label.new(f_lblX(g.bar_time, time + extendMs), f_lblY(g.max, g.min), ifvgBull ? lblBullIFVGText : lblBearIFVGText, xloc=xloc.bar_time, style=lblStyle, color=lblBgColor, textcolor=lblTextColor, size=lblSize) : na)
 
             // Flag for alertcondition
             if ifvgBull
